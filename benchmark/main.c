@@ -480,6 +480,9 @@ static void free_glyph(GlyphGeo *g) { free(g->curves); g->curves = NULL; }
 /* =========================================================================
  * GPU state
  * ========================================================================= */
+#define SCENE_TEX_W 2048
+#define SCENE_TEX_H 512
+
 static GLuint g_ssbo      = 0;   /* curve SSBO */
 static GLuint g_scene_tex = 0;   /* scene render-target */
 static GLuint g_scene_fbo = 0;
@@ -521,7 +524,7 @@ static void init_gpu(void)
 
     /* scene texture (2048×512 RGBA8, cleared to teal per frame) */
     glBindTexture(GL_TEXTURE_2D, g_scene_tex);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 2048, 512);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, SCENE_TEX_W, SCENE_TEX_H);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glBindFramebuffer(GL_FRAMEBUFFER, g_scene_fbo);
@@ -654,7 +657,38 @@ static void blit_to_screen(GLFWwindow *win, double gpu_ms)
 {
     glfwGetFramebufferSize(win, &g_sw, &g_sh);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    glViewport(0, 0, g_sw, g_sh);
+
+    /* The scene texture is a fixed SCENE_TEX_W x SCENE_TEX_H. Stretching it
+     * to whatever framebuffer size the window/OS happens to report
+     * (g_sw x g_sh) with GL_NEAREST magnification means a non-integer scale
+     * ratio (e.g. a 600px-tall window against a 512px-tall texture, or any
+     * HiDPI content scale) causes UNEVEN row duplication: some source
+     * scanlines get sampled twice by the nearest-neighbor filter, others
+     * only once, in an irregular repeating pattern roughly every
+     * 1/(ratio-1) rows. That's what was producing the "vertical offset" --
+     * whole destination scanlines duplicated out of step with their
+     * neighbors. It happens here in the post-process blit, after
+     * rasterization, which is why it looked identical regardless of
+     * whether the scene texture was filled by the scanline sweep or the
+     * ray-stabber shader.
+     *
+     * Fix: always blit at 1:1 (or a clean integer multiple) and
+     * letterbox/pillarbox any leftover space, so every destination pixel
+     * maps to exactly one source texel -- no fractional row ever needs to
+     * be duplicated. */
+    int scale = g_sw / SCENE_TEX_W;
+    int scale_y = g_sh / SCENE_TEX_H;
+    if (scale_y < scale) scale = scale_y;
+    if (scale < 1) scale = 1;
+
+    int vw = SCENE_TEX_W * scale;
+    int vh = SCENE_TEX_H * scale;
+    int vx = (g_sw - vw) / 2;
+    int vy = (g_sh - vh) / 2;
+
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glViewport(vx, vy, vw, vh);
 
     glUseProgram(g_prog_blit);
     glActiveTexture(GL_TEXTURE0);
