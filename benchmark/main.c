@@ -12,6 +12,7 @@
  * Controls:
  *   F        — cycle font   (Geist ↔ Miama)
  *   R        — cycle renderer (Sweep/Trapezoid → Sweep/Accurate → RayStab)
+ *   Enter    — edit rendered text (Enter again to commit, Esc to cancel)
  *   Drag LMB — pan
  *   Drag RMB — rotate
  *   Scroll   — zoom in/out (toward cursor)
@@ -54,7 +55,7 @@ static const char *GLYPH_CS_TEMPLATE =
     "layout(local_size_x = 8, local_size_y = 8) in;\n"
     "\n"
     "layout(std430, binding = 0) readonly buffer Curves { float c[]; };\n"
-    "layout(rgba8, binding = 1) writeonly uniform image2D out_img;\n"
+    "layout(rgba8, binding = 1) uniform image2D out_img;\n"
     "\n"
     "uniform int  curve_count;\n"
     "uniform int  glyph_w;\n"
@@ -88,8 +89,10 @@ static const char *GLYPH_CS_TEMPLATE =
     "    }\n"
     "\n"
     "    float alpha = clamp(coverage, 0.0, 1.0);\n"
-    "    /* white glyph on transparent background */\n"
-    "    imageStore(out_img, ivec2(dest_x + px.x, dest_y + px.y), vec4(alpha));\n"
+    "    /* Blend with existing coverage so overlapping glyphs don't clip */\n"
+    "    float existing = imageLoad(out_img, ivec2(dest_x + px.x, dest_y + px.y)).r;\n"
+    "    float combined = clamp(existing + alpha, 0.0, 1.0);\n"
+    "    imageStore(out_img, ivec2(dest_x + px.x, dest_y + px.y), vec4(combined));\n"
     "}\n";
 
 /* ---- Alternative: ray-stabber glyph compute shader  ---- */
@@ -99,7 +102,7 @@ static const char *GLYPH_RAYSTAB_CS =
     "\n"
     "layout(local_size_x = 8, local_size_y = 8) in;\n"
     "layout(std430, binding = 0) readonly buffer Curves { float c[]; };\n"
-    "layout(rgba8, binding = 1) writeonly uniform image2D out_img;\n"
+    "layout(rgba8, binding = 1) uniform image2D out_img;\n"
     "\n"
     "uniform int  curve_count;\n"
     "uniform int  glyph_w;\n"
@@ -187,7 +190,10 @@ static const char *GLYPH_RAYSTAB_CS =
     "    }}\n"
     "\n"
     "    float alpha = hits / float(SAMPLES*SAMPLES);\n"
-    "    imageStore(out_img, ivec2(dest_x + px.x, dest_y + px.y), vec4(alpha));\n"
+    "    /* Blend with existing coverage so overlapping glyphs don't clip */\n"
+    "    float existing = imageLoad(out_img, ivec2(dest_x + px.x, dest_y + px.y)).r;\n"
+    "    float combined = clamp(existing + alpha, 0.0, 1.0);\n"
+    "    imageStore(out_img, ivec2(dest_x + px.x, dest_y + px.y), vec4(combined));\n"
     "}\n";
 
 /* ---- Fullscreen blit shaders  ----
@@ -616,7 +622,7 @@ static void render_glyph(GlyphGeo *geo, int dest_x, int dest_y)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g_ssbo);
 
     /* Scene texture as image (direct write — no intermediate blit) */
-    glBindImageTexture(1, g_scene_tex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glBindImageTexture(1, g_scene_tex, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA8);
 
     /* Params uniform block (use program uniforms as a flat set) */
     glUseProgram(prog);
@@ -642,8 +648,9 @@ static void render_glyph(GlyphGeo *geo, int dest_x, int dest_y)
 /* =========================================================================
  * Full benchmark scene
  * ========================================================================= */
-#define SENTENCE "The five boxing wizards jump quickly!"
 #define NUM_SIZES 13
+static char g_sentence[256] = "The five boxing wizards jump quickly!";
+static int  g_editing = 0;
 static const int g_sizes[NUM_SIZES] = {
     8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64, 80 };
 
@@ -666,7 +673,7 @@ static double render_scene(void)
     for (int i = 0; i < NUM_SIZES; i++) {
         int px = g_sizes[i];
         int x = 20;
-        const char *s = SENTENCE;
+        const char *s = g_sentence;
         while (*s) {
             FT_UInt gi = FT_Get_Char_Index(face, (FT_ULong)*s);
             if (gi == 0) { s++; continue; }
@@ -676,7 +683,7 @@ static double render_scene(void)
             free_glyph(&geo);
             s++;
         }
-        y -= (int)(px * 1.25f);
+        y -= (int)((float)px * 1.25f);
     }
 
     /* ---- GPU timer end ---- */
@@ -730,8 +737,9 @@ static void blit_to_screen(GLFWwindow *win, double gpu_ms)
 
     char title[256];
     snprintf(title, sizeof(title),
-             "Font: %s | Renderer: %s | GPU: %.3f ms | %.0f FPS | "
+             "%sFont: %s | Renderer: %s | GPU: %.3f ms | %.0f FPS | "
              "Zoom: %.2fx | Rot: %.0f deg",
+             g_editing ? "[EDITING] " : "",
              active_name(), g_rnames[g_renderer],
              gpu_ms, gpu_ms > 0.0 ? 1000.0/gpu_ms : 0.0,
              g_cam_zoom, g_cam_angle * (180.0f / 3.14159265f));
@@ -745,6 +753,29 @@ static void key_cb(GLFWwindow *win, int key, int sc, int act, int mods)
 {
     (void)sc; (void)mods;
     if (act != GLFW_PRESS) return;
+
+    if (g_editing) {
+        /* In editing mode: only handle Enter (commit), Escape (cancel),
+         * Backspace (delete last char), and ignore everything else.
+         * The char_cb handles actual text input. */
+        switch (key) {
+        case GLFW_KEY_ENTER:
+            g_editing = 0;
+            printf("Text set to: %s\n", g_sentence);
+            break;
+        case GLFW_KEY_ESCAPE:
+            g_editing = 0;
+            printf("Editing cancelled\n");
+            break;
+        case GLFW_KEY_BACKSPACE: {
+            int len = (int)strlen(g_sentence);
+            if (len > 0) g_sentence[len - 1] = '\0';
+            break;
+        }
+        }
+        return;
+    }
+
     switch (key) {
     case GLFW_KEY_ESCAPE: case GLFW_KEY_Q:
         glfwSetWindowShouldClose(win, GLFW_TRUE); break;
@@ -760,6 +791,22 @@ static void key_cb(GLFWwindow *win, int key, int sc, int act, int mods)
         g_cam_zoom = 1.0f;
         g_cam_angle = 0.0f;
         printf("View reset\n"); break;
+    case GLFW_KEY_ENTER:
+        g_editing = 1;
+        printf("Editing text (Enter to commit, Esc to cancel)...\n");
+        break;
+    }
+}
+
+static void char_cb(GLFWwindow *win, unsigned int codepoint)
+{
+    (void)win;
+    if (!g_editing) return;
+    int len = (int)strlen(g_sentence);
+    /* Only accept printable ASCII, leave room for null terminator */
+    if (codepoint >= 32 && codepoint <= 126 && len < (int)sizeof(g_sentence) - 1) {
+        g_sentence[len]     = (char)codepoint;
+        g_sentence[len + 1] = '\0';
     }
 }
 
@@ -851,13 +898,14 @@ int main(void)
     glfwMakeContextCurrent(win);
     glfwGetFramebufferSize(win, &g_sw, &g_sh);
     glfwSetKeyCallback(win, key_cb);
+    glfwSetCharCallback(win, char_cb);
     glfwSetMouseButtonCallback(win, mouse_button_cb);
     glfwSetCursorPosCallback(win, cursor_pos_cb);
     glfwSetScrollCallback(win, scroll_cb);
     glfwSwapInterval(0);
 
     printf("GL: %s | %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
-    printf("Controls: F font | R renderer | Esc/Q quit\n");
+    printf("Controls: F font | R renderer | Enter edit text | Esc/Q quit\n");
     printf("          drag LMB to pan | drag RMB to rotate | "
            "scroll to zoom | Home to reset view\n");
 
