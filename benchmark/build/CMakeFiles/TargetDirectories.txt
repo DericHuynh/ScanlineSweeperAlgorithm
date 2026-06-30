@@ -1,0 +1,3 @@
+/home/deric/git/ScanlineSweeperAlgorithm/benchmark/build/CMakeFiles/benchmark.dir
+/home/deric/git/ScanlineSweeperAlgorithm/benchmark/build/CMakeFiles/edit_cache.dir
+/home/deric/git/ScanlineSweeperAlgorithm/benchmark/build/CMakeFiles/rebuild_cache.dir

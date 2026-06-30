@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/benchmark.dir/link.d CMakeFiles/benchmark.dir/main.c.o -o benchmark  /usr/lib/libglfw.so.3.4 /usr/lib/libfreetype.so -lm -ldl -lpthread /usr/lib/libGLX.so /usr/lib/libOpenGL.so

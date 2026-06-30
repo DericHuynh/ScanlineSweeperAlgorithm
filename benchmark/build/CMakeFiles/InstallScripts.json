@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/deric/git/ScanlineSweeperAlgorithm/benchmark/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
