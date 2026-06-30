@@ -105,22 +105,31 @@ static const char *GLYPH_RAYSTAB_CS =
     "\n"
     "float solve_quadratic(float a, float b, float c,\n"
     "                       out float t0, out float t1) {\n"
+    "    /* t0/t1 always end up holding the IN-RANGE roots (t0 first, if\n"
+    "     * any), regardless of which raw root (smaller or larger) that\n"
+    "     * was. The caller must not assume t0 corresponds to the smaller\n"
+    "     * raw root. */\n"
+    "    t0 = -1.0; t1 = -1.0;\n"
     "    if (abs(a) < 1e-7) {\n"
     "        if (abs(b) < 1e-7) return 0.0;\n"
-    "        t0 = -c / b;\n"
-    "        return (t0 >= 0.0 && t0 <= 1.0) ? 1.0 : 0.0;\n"
+    "        float r = -c / b;\n"
+    "        if (r >= 0.0 && r <= 1.0) { t0 = r; return 1.0; }\n"
+    "        return 0.0;\n"
     "    }\n"
     "    float d = b*b - 4.0*a*c;\n"
     "    if (d < 0.0) return 0.0;\n"
     "    float sd = sqrt(d);\n"
     "    float inv2a = 0.5 / a;\n"
-    "    t0 = (-b - sd) * inv2a;\n"
-    "    t1 = (-b + sd) * inv2a;\n"
-    "    if (t0 > t1) { float tmp = t0; t0 = t1; t1 = tmp; }\n"
-    "    int cnt = 0;\n"
-    "    if (t0 >= 0.0 && t0 <= 1.0) cnt++;\n"
-    "    if (t1 >= 0.0 && t1 <= 1.0) cnt++;\n"
-    "    return float(cnt);\n"
+    "    float r0 = (-b - sd) * inv2a;\n"
+    "    float r1 = (-b + sd) * inv2a;\n"
+    "    if (r0 > r1) { float tmp = r0; r0 = r1; r1 = tmp; }\n"
+    "    float cnt = 0.0;\n"
+    "    if (r0 >= 0.0 && r0 <= 1.0) { t0 = r0; cnt += 1.0; }\n"
+    "    if (r1 >= 0.0 && r1 <= 1.0) {\n"
+    "        if (cnt < 0.5) t0 = r1; else t1 = r1;\n"
+    "        cnt += 1.0;\n"
+    "    }\n"
+    "    return cnt;\n"
     "}\n"
     "\n"
     "vec2 eval_bezier(vec2 p0, vec2 p1, vec2 p2, float t) {\n"
@@ -303,30 +312,52 @@ static void cl_free(CurveList *cl) {
 }
 
 /* =========================================================================
- * Quadratic-Bézier subdivision → y-monotonic segments
+ * Quadratic-Bézier subdivision → fully (x AND y) monotonic segments
  * ========================================================================= */
-static int is_y_monotonic(float y0, float y1, float y2)
+/* The GLSL/HLSL scanline_sweep() requires that BOTH axes be monotonic
+ * (see the "all(p0 <= p1) and all(p1 <= p2)" precondition in
+ * scanline_sweep.glsl/.hlsl), since intersect_monotonic() is invoked on
+ * x as well as y. Checking y alone lets curves through that still bulge
+ * sideways, which breaks the x root-selection right where curves turn —
+ * i.e. the tops/bottoms of bowls. */
+static int is_axis_monotonic(float v0, float v1, float v2)
 {
-    float qa = y0 - 2.f*y1 + y2;
+    float qa = v0 - 2.f*v1 + v2;
     if (fabsf(qa) < 1e-6f) return 1;
-    float t = (y0 - y1) / qa;
+    float t = (v0 - v1) / qa;
     return t <= 0.f || t >= 1.f;
+}
+
+/* Caller must already know this axis is non-monotonic (qa != 0 and the
+ * extremum lies strictly inside (0,1)). */
+static float axis_extremum_t(float v0, float v1, float v2)
+{
+    float qa = v0 - 2.f*v1 + v2;
+    return (v0 - v1) / qa;
 }
 
 static void add_monotonic(CurveList *cl, V2 p0, V2 p1, V2 p2)
 {
-    if (is_y_monotonic(p0.y, p1.y, p2.y)) {
+    int x_ok = is_axis_monotonic(p0.x, p1.x, p2.x);
+    int y_ok = is_axis_monotonic(p0.y, p1.y, p2.y);
+
+    if (x_ok && y_ok) {
         cl_push(cl, (BezierCurve){p0, p1, p2});
-    } else {
-        float qa = p0.y - 2.f*p1.y + p2.y;
-        float t  = (p0.y - p1.y) / qa;
-        /* de Casteljau at t */
-        V2 p01 = { (1.f-t)*p0.x + t*p1.x, (1.f-t)*p0.y + t*p1.y };
-        V2 p12 = { (1.f-t)*p1.x + t*p2.x, (1.f-t)*p1.y + t*p2.y };
-        V2 q   = { (1.f-t)*p01.x + t*p12.x, (1.f-t)*p01.y + t*p12.y };
-        add_monotonic(cl, p0, p01, q);
-        add_monotonic(cl, q, p12, p2);
+        return;
     }
+
+    /* Split at whichever extremum occurs first; the other side will be
+     * picked up by the recursive call(s) if it still needs splitting. */
+    float tx = x_ok ? 2.f : axis_extremum_t(p0.x, p1.x, p2.x);
+    float ty = y_ok ? 2.f : axis_extremum_t(p0.y, p1.y, p2.y);
+    float t  = (tx < ty) ? tx : ty;  /* guaranteed in (0,1) */
+
+    /* de Casteljau at t */
+    V2 p01 = { (1.f-t)*p0.x + t*p1.x, (1.f-t)*p0.y + t*p1.y };
+    V2 p12 = { (1.f-t)*p1.x + t*p2.x, (1.f-t)*p1.y + t*p2.y };
+    V2 q   = { (1.f-t)*p01.x + t*p12.x, (1.f-t)*p01.y + t*p12.y };
+    add_monotonic(cl, p0, p01, q);
+    add_monotonic(cl, q, p12, p2);
 }
 
 /* =========================================================================
