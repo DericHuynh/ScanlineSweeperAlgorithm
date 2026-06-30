@@ -67,8 +67,8 @@ void load_curve(uint index, out vec2 p0, out vec2 p1, out vec2 p2)
 // ---------------------------------------------------------------------------
 // Forward declarations of algorithm functions (bezier_intersect.glsl + scanline_sweep.glsl).
 // ---------------------------------------------------------------------------
-float intersect_monotonic_bezier(float qa, float c0, float c1, float c2,
-                                 float target, float delta_sign);
+float intersect_monotonic(float qa, float c0, float c1, float c2,
+                            float target);
 
 vec2 evaluate_bezier(vec2 p0, vec2 p1, vec2 p2, float t);
 
@@ -76,17 +76,17 @@ vec2 evaluate_bezier(vec2 p0, vec2 p1, vec2 p2, float t);
 // or 0 for the trapezoidal approximation.
 #define ACCURATE_COVERAGE 1
 
-float scanline_sweep(vec2 pixel_size, vec2 pixel_offset,
+float scanline_sweep(vec2 size, vec2 offset,
                      vec2 p0, vec2 p1, vec2 p2);
 
 // ---------------------------------------------------------------------------
-// intersect_monotonic_bezier
+// intersect_monotonic
 // ---------------------------------------------------------------------------
-float intersect_monotonic_bezier(
+float intersect_monotonic(
     float qa, float c0, float c1, float c2,
-    float target, float delta_sign)
+    float target)
 {
-    if (abs(qa) < 1e-2)
+    if (abs(qa) < 1e-3)
     {
         return (target - c0) / (c2 - c0);
     }
@@ -97,7 +97,7 @@ float intersect_monotonic_bezier(
     float sqrt_d = d < 0.0 ? 0.0 : sqrt(d);
     float inv_2a = 0.5 / qa;
 
-    return mad(-qb, inv_2a, delta_sign * sqrt_d * inv_2a);
+    return mad(-qb, inv_2a, sign(c2 - c0) * sqrt_d * inv_2a);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,146 +105,174 @@ float intersect_monotonic_bezier(
 // ---------------------------------------------------------------------------
 vec2 evaluate_bezier(vec2 p0, vec2 p1, vec2 p2, float t)
 {
-    float mt = 1.0 - t;
-    float a  = mt * mt;
-    float b  = 2.0 * mt * t;
-    float c  = t * t;
-    return a * p0 + b * p1 + c * p2;
+    vec2 a = mix(p0, p1, t);
+    vec2 b = mix(p1, p2, t);
+    return mix(a, b, t);
 }
 
 // ---------------------------------------------------------------------------
 // scanline_sweep  (full implementation)
 // ---------------------------------------------------------------------------
 float scanline_sweep(
-    vec2 pixel_size,
-    vec2 pixel_offset,
+    vec2 size,
+    vec2 offset,
     vec2 p0,
     vec2 p1,
     vec2 p2)
 {
-    // Discard curves entirely above or below the scanline.
-    if (max(p0.y, p2.y) <= pixel_offset.y ||
-        min(p0.y, p2.y) >= pixel_offset.y + pixel_size.y)
+    // Discard curves above or below the scanline.
+    if (max(p0.y, p2.y) <= offset.y || min(p0.y, p2.y) >= offset.y + size.y)
     {
         return 0.0;
     }
 
     vec2 delta = p2 - p0;
 
-    p0 -= pixel_offset;
-    p1 -= pixel_offset;
-    p2 -= pixel_offset;
+    // Shift all control points to a coordinate system with the
+    // window at the origin.
+    p0 -= offset;
+    p1 -= offset;
+    p2 -= offset;
 
-    // Fast path: strictly vertical segments.
+    // Fast path for strictly vertical segments, common in many fonts.
     if (p0.x == p1.x && p0.x == p2.x)
     {
-        if (p0.x >= pixel_size.x) { return 0.0; }
-
-        float top    = min(max(p0.y, p2.y), pixel_size.y);
-        float bottom = max(min(p0.y, p2.y), 0.0);
-        float height = top - bottom;
-
-        if (p0.x <= 0.0)
+        if (p0.x >= size.x)
         {
-            return sign(delta.y) * pixel_size.x * height;
+            // Segment is to the right of the window. Nothing to do.
+            return 0.0;
         }
 
-        float base = pixel_size.x - p0.x;
-        return sign(delta.y) * base * height;
+        float t = min(max(p0.y, p2.y), size.y);
+        float b = max(min(p0.y, p2.y), 0.0);
+        float h = t - b;
+        float w = min(size.x, size.x - p0.x);
+
+        // Signed area of the swept rectangle.
+        return sign(delta.y) * w * h;
     }
 
-    // Y-boundary intersections.
-    float qa_y = mad(-2.0, p1.y, p0.y + p2.y);
-    float bt = intersect_monotonic_bezier(qa_y, p0.y, p1.y, p2.y, 0.0, sign(delta.y));
-    float tt = intersect_monotonic_bezier(qa_y, p0.y, p1.y, p2.y, pixel_size.y, sign(delta.y));
+    // qa is the second-degree coefficient for the y-coordinate
+    // quadratic.
+    float qa = mad(-2.0, p1.y, p0.y + p2.y);
 
-    float v_min = delta.y > 0.0 ? bt : tt;
-    float v_max = delta.y > 0.0 ? tt : bt;
-    vec2  v_min_crossing = evaluate_bezier(p0, p1, p2, saturate(v_min));
-    vec2  v_max_crossing = evaluate_bezier(p0, p1, p2, saturate(v_max));
+    float bt = intersect_monotonic(qa, p0.y, p1.y, p2.y, 0.0);
+    float tt = intersect_monotonic(qa, p0.y, p1.y, p2.y, size.y);
 
-    if (max(v_min_crossing.x, v_max_crossing.x) <= 0.0)
+    // v_min_t and v_max_t are the crossings where the curve enters
+    // and exits the scanline.
+    float v_min_t = delta.y > 0.0 ? bt : tt;
+    float v_max_t = delta.y > 0.0 ? tt : bt;
+
+    vec2 v_min = evaluate_bezier(p0, p1, p2, saturate(v_min_t));
+    vec2 v_max = evaluate_bezier(p0, p1, p2, saturate(v_max_t));
+
+    if (max(v_min.x, v_max.x) <= 0.0)
     {
-        return (v_max_crossing.y - v_min_crossing.y) * pixel_size.x;
+        // Fast path for curves entirely to the left of the window
+        // within the scanline. Note that the area sign is
+        // incorporated in the result.
+        return (v_max.y - v_min.y) * size.x;
     }
 
-    if (min(v_min_crossing.x, v_max_crossing.x) >= pixel_size.x)
+    if (min(v_min.x, v_max.x) >= size.x)
     {
+        // The curve is entirely to the right of the window within
+        // the scanline, so it can be ignored.
         return 0.0;
     }
 
-    // X-boundary intersections.
-    float qa_x    = mad(-2.0, p1.x, p0.x + p2.x);
-    float dx_sign = sign(delta.x);
+    // Solve for roots along x.
+    qa = mad(-2.0, p1.x, p0.x + p2.x);
 
-    float h_min, h_max;
+    // As with v_min_t and v_max_t, we now need the values of t where
+    // the curve enters and exits the window moving horizontally.
+    float h_min_t;
+    float h_max_t;
 
+    // This check vector stores the following quantities in each component:
+    // - lower x bound
+    // - upper x bound
+    // - target value
+    // - parameter associated with the lower x bound (0 or 1)
+    //
+    // Packing the values in this way simplifies bounds checks and intersection
+    // testing, and the values depend on the direction the curve moves.
     vec4 h_check = delta.x > 0.0
         ? vec4(p0.x, p2.x, 0.0, 0.0)
-        : vec4(p2.x, p0.x, pixel_size.x, 1.0);
+        : vec4(p2.x, p0.x, size.x, 1.0);
 
     if (h_check.x >= h_check.z)
     {
-        h_min = h_check.w;
+        h_min_t = h_check.w;
     }
     else if (h_check.y <= h_check.z)
     {
-        h_min = 1.0 - h_check.w;
+        h_min_t = 1.0 - h_check.w;
     }
     else
     {
-        h_min = intersect_monotonic_bezier(qa_x, p0.x, p1.x, p2.x, h_check.z, dx_sign);
+        h_min_t = intersect_monotonic(qa, p0.x, p1.x, p2.x, h_check.z);
     }
 
-    float h_target_max = delta.x > 0.0 ? pixel_size.x : 0.0;
+    h_check.z = size.x - h_check.z;
 
-    if (h_check.x >= h_target_max)
+    if (h_check.x >= h_check.z)
     {
-        h_max = h_check.w;
+        h_max_t = h_check.w;
     }
-    else if (h_check.y <= h_target_max)
+    else if (h_check.y <= h_check.z)
     {
-        h_max = 1.0 - h_check.w;
+        h_max_t = 1.0 - h_check.w;
     }
     else
     {
-        h_max = intersect_monotonic_bezier(qa_x, p0.x, p1.x, p2.x, h_target_max, dx_sign);
+        h_max_t = intersect_monotonic(qa, p0.x, p1.x, p2.x, h_check.z);
     }
 
-    float t_min = saturate(max(v_min, h_min));
-    float t_max = saturate(min(v_max, h_max));
+    // Now, we can compute the values of t for which the curve enters
+    // and leaves the window in any direction. Note that these values
+    // are constrained to the unit interval, so it's ok if the curve
+    // stops or ends within the window.
+    float min_t = saturate(max(v_min_t, h_min_t));
+    float max_t = saturate(min(v_max_t, h_max_t));
 
-    vec2 q0 = v_min >= h_max ? v_min_crossing : evaluate_bezier(p0, p1, p2, t_min);
-    vec2 q1 = v_max <= h_min ? v_max_crossing : evaluate_bezier(p0, p1, p2, t_max);
+    // Evaluate the curve at new intersection points if needed based
+    // on the newly constrained interval.
+    vec2 q0 = v_min_t >= h_min_t ? v_min : evaluate_bezier(p0, p1, p2, min_t);
+    vec2 q1 = v_max_t <= h_max_t ? v_max : evaluate_bezier(p0, p1, p2, max_t);
 
     float coverage = 0.0;
 
-    // External contributions.
-    if (t_min > 0.0 && delta.x > 0.0)
+    if (min_t > 0.0 && delta.x > 0.0)
     {
+        // We enter the pixel from the left, so we need to integrate the
+        // swept rectangle below the entry point.
         float h = delta.y > 0.0
             ? q0.y - max(0.0, p0.y)
-            : min(pixel_size.y, p0.y) - q0.y;
-        coverage = sign(delta.y) * h * pixel_size.x;
+            : min(size.y, p0.y) - q0.y;
+        coverage = sign(delta.y) * h * size.x;
     }
 
-    if (t_max < 1.0 && delta.x > 0.0)
+    if (max_t < 1.0 && delta.x < 0.0)
     {
+        // We exit the pixel on the left side, so we need to integrate the
+        // swept rectangle after the exit point.
         float h = delta.y > 0.0
-            ? min(pixel_size.y, p2.y) - q1.y
+            ? min(size.y, p2.y) - q1.y
             : q1.y - max(0.0, p2.y);
-        coverage += sign(delta.y) * h * pixel_size.x;
+        coverage += sign(delta.y) * h * size.x;
     }
 
 #if ACCURATE_COVERAGE
     // Continuous integration of bezier area.
-    float px = pixel_size.x;
+    float px = size.x;
 
-    float ax = qa_x;
+    float ax = qa;
     float bx = mad(2.0, p1.x, -2.0 * p0.x);
     float cx = p0.x;
 
-    float ay = qa_y;
+    float ay = mad(-2.0, p1.y, p0.y + p2.y);
     float by = mad(2.0, p1.y, -2.0 * p0.y);
     float cy = p0.y;
 
@@ -253,17 +281,24 @@ float scanline_sweep(
     float c2 = ay * (px - cx) - 0.5 * bx * by;
     float c3 = (px - cx) * by;
 
-    float ft_max = t_max * (c3 + t_max * (c2 + t_max * (c1 + t_max * c0)));
-    float ft_min = t_min * (c3 + t_min * (c2 + t_min * (c1 + t_min * c0)));
+    float ft_max = max_t * (c3 + max_t * (c2 + max_t * (c1 + max_t * c0)));
+    float ft_min = min_t * (c3 + min_t * (c2 + min_t * (c1 + min_t * c0)));
 
     coverage += ft_max - ft_min;
 #else
-    // Trapezoidal approximation.
+    // This implements the simple trapezoidal approximation for the
+    // portion of the curve within the window.
     float h = q1.y - q0.y;
-    float b = mad(-0.5, q0.x + q1.x, pixel_size.x);
+
+    // Sum of trapezoid bases divided by two. If q0.x or q1.x happen
+    // to equal size.x, the trapezoidal area is effectively a triangle.
+    float b = mad(-0.5, q0.x + q1.x, size.x);
+
     coverage += b * h;
 #endif
 
+    // The caller is expected to accumulate this coverage for each curve,
+    // and divide the final result by the window area.
     return coverage;
 }
 

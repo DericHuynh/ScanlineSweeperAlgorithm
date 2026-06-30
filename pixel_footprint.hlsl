@@ -45,9 +45,9 @@ RWTexture2D<float4> output_image : register(u0);
 // ---------------------------------------------------------------------------
 // Forward declarations
 // ---------------------------------------------------------------------------
-float  intersect_monotonic_bezier(float qa, float c0, float c1, float c2, float target, float delta_sign);
+float  intersect_monotonic(float qa, float c0, float c1, float c2, float target);
 float2 evaluate_bezier(float2 p0, float2 p1, float2 p2, float t);
-float  scanline_sweep(float2 pixel_size, float2 pixel_offset, float2 p0, float2 p1, float2 p2);
+float  scanline_sweep(float2 size, float2 offset, float2 p0, float2 p1, float2 p2);
 
 // ---------------------------------------------------------------------------
 // Main — one thread per pixel
