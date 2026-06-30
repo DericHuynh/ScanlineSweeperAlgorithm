@@ -12,6 +12,10 @@
  * Controls:
  *   F        — cycle font   (Geist ↔ Miama)
  *   R        — cycle renderer (Sweep/Trapezoid → Sweep/Accurate → RayStab)
+ *   Drag LMB — pan
+ *   Drag RMB — rotate
+ *   Scroll   — zoom in/out (toward cursor)
+ *   Home     — reset view
  *   ESC / Q  — quit
  */
 
@@ -186,26 +190,46 @@ static const char *GLYPH_RAYSTAB_CS =
     "    imageStore(out_img, ivec2(dest_x + px.x, dest_y + px.y), vec4(alpha));\n"
     "}\n";
 
-/* ---- Fullscreen blit shaders  ---- */
+/* ---- Fullscreen blit shaders  ----
+ * The camera transform (pan/zoom/rotate) is resolved per-fragment from
+ * gl_FragCoord rather than baked into a vertex-interpolated UV or a
+ * glViewport stretch. This is what lets zoom be smooth and arbitrary
+ * (not just integer multiples) without uneven nearest-neighbor row/col
+ * duplication: every fragment computes its own exact texture coordinate
+ * instead of inheriting one that was rounded during rasterization of a
+ * stretched quad. */
 static const char *BLIT_VS =
     "#version 330 core\n"
     "const vec2 pos[4] = vec2[4](\n"
     "    vec2(-1,-1), vec2(1,-1), vec2(-1,1), vec2(1,1));\n"
-    "out vec2 v_uv;\n"
     "void main() {\n"
     "    gl_Position = vec4(pos[gl_VertexID], 0, 1);\n"
-    "    v_uv = pos[gl_VertexID] * 0.5 + 0.5;\n"
     "}\n";
 
 static const char *BLIT_FS =
     "#version 330 core\n"
-    "in vec2 v_uv;\n"
     "uniform sampler2D u_tex;\n"
-    "uniform vec3 u_tint;\n"
+    "uniform vec3  u_tint;\n"
+    "uniform vec2  u_screen_size;  /* framebuffer size, px */\n"
+    "uniform vec2  u_tex_size;     /* scene texture size, px */\n"
+    "uniform vec2  u_cam_center;   /* texture px the camera looks at */\n"
+    "uniform float u_zoom;         /* screen px per texture px */\n"
+    "uniform float u_angle;        /* camera rotation, radians */\n"
     "out vec4 out_color;\n"
     "void main() {\n"
-    "    float a = texture(u_tex, v_uv).r;\n"
-    "    out_color = vec4(u_tint * a + vec3(0.05,0.18,0.18)*(1.0-a), 1.0);\n"
+    "    vec2 center = u_screen_size * 0.5;\n"
+    "    vec2 p = gl_FragCoord.xy - center;          /* y-up, screen px from center */\n"
+    "    float ca = cos(-u_angle), sa = sin(-u_angle);\n"
+    "    vec2 pr = vec2(ca*p.x - sa*p.y, sa*p.x + ca*p.y);\n"
+    "    vec2 tex_px = u_cam_center + pr / u_zoom;   /* texture px, origin bottom-left */\n"
+    "    vec2 uv = tex_px / u_tex_size;\n"
+    "    vec3 bg = vec3(0.05, 0.18, 0.18);\n"
+    "    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {\n"
+    "        out_color = vec4(bg, 1.0);\n"
+    "        return;\n"
+    "    }\n"
+    "    float a = texture(u_tex, uv).r;\n"
+    "    out_color = vec4(u_tint * a + bg * (1.0 - a), 1.0);\n"
     "}\n";
 
 /* =========================================================================
@@ -495,6 +519,21 @@ static GLuint g_vao            = 0;
 static int    g_sw, g_sh;              /* window framebuffer size */
 
 /* =========================================================================
+ * Camera (pan / zoom / rotate over the scene texture)
+ * ========================================================================= */
+static float g_cam_x     = SCENE_TEX_W * 0.5f;  /* texture px the camera centers on */
+static float g_cam_y     = SCENE_TEX_H * 0.5f;
+static float g_cam_zoom  = 1.0f;                /* screen px per texture px */
+static float g_cam_angle = 0.0f;                /* radians */
+
+#define CAM_ZOOM_MIN 0.05f
+#define CAM_ZOOM_MAX 64.0f
+
+static double g_last_mx = 0.0, g_last_my = 0.0;
+static int    g_dragging_pan = 0;
+static int    g_dragging_rot = 0;
+
+/* =========================================================================
  * Renderer enum
  * ========================================================================= */
 typedef enum { R_SWEEP, R_SWEEP_ACC, R_RAYSTAB, R_COUNT } Renderer;
@@ -657,53 +696,45 @@ static void blit_to_screen(GLFWwindow *win, double gpu_ms)
 {
     glfwGetFramebufferSize(win, &g_sw, &g_sh);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, g_sw, g_sh);
 
-    /* The scene texture is a fixed SCENE_TEX_W x SCENE_TEX_H. Stretching it
-     * to whatever framebuffer size the window/OS happens to report
-     * (g_sw x g_sh) with GL_NEAREST magnification means a non-integer scale
-     * ratio (e.g. a 600px-tall window against a 512px-tall texture, or any
-     * HiDPI content scale) causes UNEVEN row duplication: some source
-     * scanlines get sampled twice by the nearest-neighbor filter, others
-     * only once, in an irregular repeating pattern roughly every
-     * 1/(ratio-1) rows. That's what was producing the "vertical offset" --
-     * whole destination scanlines duplicated out of step with their
-     * neighbors. It happens here in the post-process blit, after
-     * rasterization, which is why it looked identical regardless of
-     * whether the scene texture was filled by the scanline sweep or the
-     * ray-stabber shader.
-     *
-     * Fix: always blit at 1:1 (or a clean integer multiple) and
-     * letterbox/pillarbox any leftover space, so every destination pixel
-     * maps to exactly one source texel -- no fractional row ever needs to
-     * be duplicated. */
-    int scale = g_sw / SCENE_TEX_W;
-    int scale_y = g_sh / SCENE_TEX_H;
-    if (scale_y < scale) scale = scale_y;
-    if (scale < 1) scale = 1;
-
-    int vw = SCENE_TEX_W * scale;
-    int vh = SCENE_TEX_H * scale;
-    int vx = (g_sw - vw) / 2;
-    int vy = (g_sh - vh) / 2;
-
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClearColor(0.05f, 0.18f, 0.18f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
-    glViewport(vx, vy, vw, vh);
 
     glUseProgram(g_prog_blit);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_scene_tex);
+
+    /* NEAREST while zoomed in or at 1:1, so AA steps stay crisp and
+     * inspectable; LINEAR once zoomed out past 1:1, so minification
+     * doesn't alias. (This is a deliberate choice for a pixel-peeping
+     * tool -- it's not what caused the earlier bug, which was a fixed,
+     * unintentional stretch baked into a non-resizable benchmark view.) */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                     g_cam_zoom >= 1.0f ? GL_NEAREST : GL_LINEAR);
+
     glUniform1i(glGetUniformLocation(g_prog_blit, "u_tex"), 0);
     /* white tint for glyphs, teal background is baked */
     glUniform3f(glGetUniformLocation(g_prog_blit, "u_tint"), 1.f, 1.f, 1.f);
+    glUniform2f(glGetUniformLocation(g_prog_blit, "u_screen_size"),
+                (float)g_sw, (float)g_sh);
+    glUniform2f(glGetUniformLocation(g_prog_blit, "u_tex_size"),
+                (float)SCENE_TEX_W, (float)SCENE_TEX_H);
+    glUniform2f(glGetUniformLocation(g_prog_blit, "u_cam_center"),
+                g_cam_x, g_cam_y);
+    glUniform1f(glGetUniformLocation(g_prog_blit, "u_zoom"), g_cam_zoom);
+    glUniform1f(glGetUniformLocation(g_prog_blit, "u_angle"), g_cam_angle);
+
     glBindVertexArray(g_vao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
     char title[256];
     snprintf(title, sizeof(title),
-             "Font: %s | Renderer: %s | GPU: %.3f ms | %.0f FPS",
+             "Font: %s | Renderer: %s | GPU: %.3f ms | %.0f FPS | "
+             "Zoom: %.2fx | Rot: %.0f deg",
              active_name(), g_rnames[g_renderer],
-             gpu_ms, gpu_ms > 0.0 ? 1000.0/gpu_ms : 0.0);
+             gpu_ms, gpu_ms > 0.0 ? 1000.0/gpu_ms : 0.0,
+             g_cam_zoom, g_cam_angle * (180.0f / 3.14159265f));
     glfwSetWindowTitle(win, title);
 }
 
@@ -723,7 +754,85 @@ static void key_cb(GLFWwindow *win, int key, int sc, int act, int mods)
     case GLFW_KEY_R:
         g_renderer = (g_renderer + 1) % R_COUNT;
         printf("Renderer: %s\n", g_rnames[g_renderer]); break;
+    case GLFW_KEY_HOME:
+        g_cam_x = SCENE_TEX_W * 0.5f;
+        g_cam_y = SCENE_TEX_H * 0.5f;
+        g_cam_zoom = 1.0f;
+        g_cam_angle = 0.0f;
+        printf("View reset\n"); break;
     }
+}
+
+/* Left-drag pans, right-drag rotates. Both are resolved against the
+ * camera's *current* rotation/zoom so a drag always tracks the cursor,
+ * regardless of how the view is currently tilted or zoomed. */
+static void mouse_button_cb(GLFWwindow *win, int button, int action, int mods)
+{
+    (void)mods;
+    double mx, my;
+    glfwGetCursorPos(win, &mx, &my);
+    if (button == GLFW_MOUSE_BUTTON_LEFT) {
+        g_dragging_pan = (action == GLFW_PRESS);
+        g_last_mx = mx; g_last_my = my;
+    } else if (button == GLFW_MOUSE_BUTTON_RIGHT) {
+        g_dragging_rot = (action == GLFW_PRESS);
+        g_last_mx = mx; g_last_my = my;
+    }
+}
+
+static void cursor_pos_cb(GLFWwindow *win, double mx, double my)
+{
+    (void)win;
+    double dmx = mx - g_last_mx;
+    double dmy = my - g_last_my;
+
+    if (g_dragging_pan && g_cam_zoom > 0.0f) {
+        /* Mouse-space is y-down; our screen-space (matching gl_FragCoord)
+         * is y-up, so flip dy. Inverse-rotate the drag delta by the
+         * camera's current angle so panning always follows the cursor. */
+        float dsx = (float)dmx;
+        float dsy = -(float)dmy;
+        float ca = cosf(-g_cam_angle), sa = sinf(-g_cam_angle);
+        float rx = ca*dsx - sa*dsy;
+        float ry = sa*dsx + ca*dsy;
+        g_cam_x -= rx / g_cam_zoom;
+        g_cam_y -= ry / g_cam_zoom;
+    }
+
+    if (g_dragging_rot) {
+        /* Horizontal drag rotates; sensitivity tuned so a full window
+         * width of drag is roughly one full turn. */
+        g_cam_angle += (float)dmx * 0.01f;
+    }
+
+    g_last_mx = mx; g_last_my = my;
+}
+
+/* Scroll wheel zooms in/out, keeping the texture point currently under
+ * the cursor fixed on screen (the usual "zoom toward cursor" UX). */
+static void scroll_cb(GLFWwindow *win, double xoff, double yoff)
+{
+    (void)win; (void)xoff;
+    if (yoff == 0.0) return;
+
+    double mx, my;
+    glfwGetCursorPos(win, &mx, &my);
+
+    float old_zoom = g_cam_zoom;
+    float new_zoom = old_zoom * powf(1.1f, (float)yoff);
+    if (new_zoom < CAM_ZOOM_MIN) new_zoom = CAM_ZOOM_MIN;
+    if (new_zoom > CAM_ZOOM_MAX) new_zoom = CAM_ZOOM_MAX;
+    if (new_zoom == old_zoom) return;
+
+    float px = (float)mx - (float)g_sw * 0.5f;
+    float py = -((float)my - (float)g_sh * 0.5f);  /* mouse y-down -> y-up */
+    float ca = cosf(-g_cam_angle), sa = sinf(-g_cam_angle);
+    float wx = ca*px - sa*py;
+    float wy = sa*px + ca*py;
+
+    g_cam_x += wx * (1.0f/old_zoom - 1.0f/new_zoom);
+    g_cam_y += wy * (1.0f/old_zoom - 1.0f/new_zoom);
+    g_cam_zoom = new_zoom;
 }
 
 /* =========================================================================
@@ -740,10 +849,17 @@ int main(void)
     GLFWwindow *win = glfwCreateWindow(2048, 600, "Benchmark", NULL, NULL);
     if (!win) { fprintf(stderr,"window failed\n"); return 1; }
     glfwMakeContextCurrent(win);
+    glfwGetFramebufferSize(win, &g_sw, &g_sh);
     glfwSetKeyCallback(win, key_cb);
+    glfwSetMouseButtonCallback(win, mouse_button_cb);
+    glfwSetCursorPosCallback(win, cursor_pos_cb);
+    glfwSetScrollCallback(win, scroll_cb);
     glfwSwapInterval(0);
 
     printf("GL: %s | %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
+    printf("Controls: F font | R renderer | Esc/Q quit\n");
+    printf("          drag LMB to pan | drag RMB to rotate | "
+           "scroll to zoom | Home to reset view\n");
 
     /* FreeType */
     if (FT_Init_FreeType(&g_ft)) { fprintf(stderr,"FT init failed\n"); return 1; }
